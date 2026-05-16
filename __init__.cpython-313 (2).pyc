@@ -1,0 +1,33 @@
+from pathlib import Path
+
+
+def preprocess_for_ocr(image_path: str | Path) -> str:
+    """
+    Базовая предобработка для OCR.
+
+    MVP специально сделан так, чтобы не падать без OpenCV:
+    если cv2 недоступен или изображение не читается, возвращаем исходный путь.
+    """
+    image_path = Path(image_path)
+
+    try:
+        import cv2
+    except Exception:
+        return str(image_path)
+
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return str(image_path)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Увеличение помогает OCR на мелких цифрах линии.
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+    # Мягкий шумодав + бинаризация.
+    gray = cv2.medianBlur(gray, 3)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    out_path = image_path.with_name(image_path.stem + "_ocr.png")
+    cv2.imwrite(str(out_path), th)
+    return str(out_path)

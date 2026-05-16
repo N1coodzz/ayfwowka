@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from uuid import uuid4
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from config import load_config
+from engine.decision_engine import analyze_state, format_signal
+from ocr.parser import (
+    is_enough_for_analysis,
+    parse_manual_input,
+    parse_screens,
+    state_from_dict,
+    state_to_dict,
+)
+from storage.logger import append_signal, format_history, format_stats
+
+
+router = Router()
+cfg = load_config()
+
+
+class AnalyzeFlow(StatesGroup):
+    waiting_map_image = State()
+    waiting_line_image = State()
+    waiting_confirm = State()
+    waiting_manual_input = State()
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да", callback_data="ocr_yes"),
+                InlineKeyboardButton(text="Нет", callback_data="ocr_no"),
+            ]
+        ]
+    )
+
+
+def render_recognized(state) -> str:
+    if state.lines:
+        lines_text = "\n".join(
+            [
+                f"{item.line:.1f}: Under {item.under_odds or '-'} / Over {item.over_odds or '-'}"
+                for item in state.lines
+            ]
+        )
+    else:
+        lines_text = "не распознаны"
+
+    return (
+        "Распознал:\n\n"
+        f"Матч: {state.match}\n"
+        f"Время: {state.time_str or '-'}\n"
+        f"Счёт: {state.score_text}\n"
+        f"Net worth diff: {state.networth_diff_k}k\n"
+        f"Линии:\n{lines_text}\n\n"
+        "Подтвердить?"
+    )
+
+
+def manual_format_hint() -> str:
+    return (
+        "Введи данные руками в формате:\n\n"
+        "match=Falcons-Spirit\n"
+        "map=1\n"
+        "time=5:33\n"
+        "score=1-1\n"
+        "nw=0.5\n"
+        "line=54.5\n"
+        "under=1.94\n"
+        "over=1.77\n\n"
+        "Для нескольких линий можно так:\n"
+        "lines=54.5:U1.94/O1.77;55.5:U1.81/O1.89"
+    )
+
+
+async def save_telegram_photo(message: Message, bot: Bot) -> Path:
+    if not message.photo:
+        raise ValueError("В сообщении нет изображения.")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+
+    filename = f"{message.from_user.id}_{uuid4().hex}.jpg"
+    path = cfg.images_dir / filename
+
+    await bot.download_file(file.file_path, destination=path)
+    return path
+
+
+async def run_decision_and_reply(message: Message, state_data) -> None:
+    match_state = state_from_dict(state_data)
+    decision = analyze_state(match_state)
+
+    append_signal(cfg.signals_csv, match_state, decision)
+
+    await message.answer(format_signal(match_state, decision))
+
+
+@router.message(CommandStart())
+async def start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Бот для live-анализа Dota 2 Total Kills.\n\n"
+        "Как пользоваться:\n"
+        "1) /analyze\n"
+        "2) отправь скрин карты Cyberscore/DLTV\n"
+        "3) отправь скрин линии букмекера Total Kills\n"
+        "4) подтверди OCR или введи данные руками\n\n"
+        "Бот не ставит деньги автоматически. Он только считает value и пишет: брать / пас."
+    )
+
+
+@router.message(Command("analyze"))
+async def analyze(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(AnalyzeFlow.waiting_map_image)
+    await message.answer("Отправь первый скрин: карта Cyberscore/DLTV.")
+
+
+@router.message(Command("history"))
+async def history(message: Message) -> None:
+    await message.answer(format_history(cfg.signals_csv, limit=10))
+
+
+@router.message(Command("stats"))
+async def stats(message: Message) -> None:
+    await message.answer(format_stats(cfg.signals_csv))
+
+
+@router.message(AnalyzeFlow.waiting_map_image, F.photo)
+async def receive_map_image(message: Message, state: FSMContext, bot: Bot) -> None:
+    path = await save_telegram_photo(message, bot)
+    await state.update_data(map_image_path=str(path))
+    await state.set_state(AnalyzeFlow.waiting_line_image)
+    await message.answer("Принял карту. Теперь отправь второй скрин: линия букмекера Total Kills.")
+
+
+@router.message(AnalyzeFlow.waiting_map_image)
+async def receive_map_image_wrong(message: Message) -> None:
+    await message.answer("Нужно отправить изображение карты. Или нажми /analyze заново.")
+
+
+@router.message(AnalyzeFlow.waiting_line_image, F.photo)
+async def receive_line_image(message: Message, state: FSMContext, bot: Bot) -> None:
+    path = await save_telegram_photo(message, bot)
+    data = await state.get_data()
+    map_image_path = data["map_image_path"]
+
+    parsed = parse_screens(map_image_path, path)
+    await state.update_data(line_image_path=str(path), parsed_state=state_to_dict(parsed))
+    await state.set_state(AnalyzeFlow.waiting_confirm)
+
+    await message.answer(render_recognized(parsed), reply_markup=confirm_keyboard())
+
+
+@router.message(AnalyzeFlow.waiting_line_image)
+async def receive_line_image_wrong(message: Message) -> None:
+    await message.answer("Нужно отправить изображение линии букмекера. Или нажми /analyze заново.")
+
+
+@router.callback_query(AnalyzeFlow.waiting_confirm, F.data == "ocr_yes")
+async def confirm_ocr_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    parsed = state_from_dict(data.get("parsed_state", {}))
+
+    if not is_enough_for_analysis(parsed):
+        await state.set_state(AnalyzeFlow.waiting_manual_input)
+        await callback.message.answer(
+            "Для анализа не хватает данных. OCR мог ошибиться.\n\n" + manual_format_hint()
+        )
+        await callback.answer()
+        return
+
+    decision = analyze_state(parsed)
+    append_signal(cfg.signals_csv, parsed, decision)
+
+    await callback.message.answer(format_signal(parsed, decision))
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(AnalyzeFlow.waiting_confirm, F.data == "ocr_no")
+async def confirm_ocr_no(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AnalyzeFlow.waiting_manual_input)
+    await callback.message.answer(manual_format_hint())
+    await callback.answer()
+
+
+@router.message(AnalyzeFlow.waiting_manual_input)
+async def receive_manual_input(message: Message, state: FSMContext) -> None:
+    parsed = parse_manual_input(message.text or "")
+
+    if not is_enough_for_analysis(parsed):
+        await message.answer(
+            "Не смог собрать данные для анализа.\n\n"
+            "Проверь, что есть time, score и хотя бы одна линия с коэффициентами.\n\n"
+            + manual_format_hint()
+        )
+        return
+
+    decision = analyze_state(parsed)
+    append_signal(cfg.signals_csv, parsed, decision)
+
+    await message.answer(format_signal(parsed, decision))
+    await state.clear()
+
+
+async def main() -> None:
+    bot = Bot(token=cfg.bot_token)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    print("Bot started.")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

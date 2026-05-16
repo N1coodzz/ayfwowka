@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+import re
+from typing import Optional
+
+from models import MatchState, MarketLine
+from ocr.image_preprocess import preprocess_for_ocr
+
+
+def parse_time_to_minutes(value: str) -> float:
+    value = value.strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", value)
+    if not m:
+        return 0.0
+    minutes = int(m.group(1))
+    seconds = int(m.group(2))
+    return minutes + seconds / 60
+
+
+def _to_float(value: str | None, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    cleaned = (
+        value.strip()
+        .lower()
+        .replace(",", ".")
+        .replace("+", "")
+        .replace("k", "")
+        .replace("к", "")
+    )
+    try:
+        return float(cleaned)
+    except ValueError:
+        return default
+
+
+def _to_int(value: str | None, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def ocr_image(image_path: str | Path) -> str:
+    """
+    Возвращает текст с картинки.
+
+    Для MVP используется pytesseract. Если Tesseract не установлен,
+    функция вернёт пустую строку, а бот перейдёт к ручному вводу.
+    """
+    image_path = Path(image_path)
+    prepared = preprocess_for_ocr(image_path)
+
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return ""
+
+    try:
+        img = Image.open(prepared)
+        # rus+eng полезно, если в линии встречается ТМ/ТБ и английские Under/Over.
+        return pytesseract.image_to_string(img, lang="eng+rus")
+    except Exception:
+        try:
+            img = Image.open(image_path)
+            return pytesseract.image_to_string(img, lang="eng")
+        except Exception:
+            return ""
+
+
+def extract_time(text: str) -> tuple[str, float]:
+    # Ищем время карты формата 5:33 / 07:04 / 16:27.
+    candidates = re.findall(r"\b([0-5]?\d:[0-5]\d)\b", text)
+    if not candidates:
+        return "", 0.0
+
+    # Обычно первое подходящее время на скрине карты — время игры.
+    time_str = candidates[0]
+    return time_str, parse_time_to_minutes(time_str)
+
+
+def extract_score(text: str) -> tuple[int, int]:
+    """
+    Ищет счёт по киллам.
+
+    Стараемся не брать время 5:33, поэтому приоритет у разделителя '-' / '–',
+    а не двоеточия.
+    """
+    patterns = [
+        r"\b(\d{1,2})\s*[–—-]\s*(\d{1,2})\b",
+        r"\bscore\s*[:=]?\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\b",
+        r"\bсч[её]т\s*[:=]?\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\b",
+    ]
+
+    for pattern in patterns:
+        for a, b in re.findall(pattern, text, flags=re.IGNORECASE):
+            ai, bi = int(a), int(b)
+            # Фильтр от случайных больших чисел.
+            if 0 <= ai <= 80 and 0 <= bi <= 80:
+                return ai, bi
+
+    return 0, 0
+
+
+def extract_match_name(text: str) -> str:
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    for line in lines[:12]:
+        if re.search(r"\s+(vs|v\.|—|-)\s+", line, flags=re.IGNORECASE):
+            cleaned = re.sub(r"\s+", " ", line)
+            return cleaned[:80]
+    return "Unknown"
+
+
+def extract_networth_diff_k(text: str) -> float:
+    """
+    Пытается вытащить net worth diff в тысячах: +3.5k, 3.5k, +3500.
+    Если не нашёл — 0.0.
+    """
+    text_l = text.lower().replace(",", ".")
+
+    # Примеры: net worth +3.5k / nw +3.5k / advantage 3500
+    m = re.search(r"(net\s*worth|nw|advantage|преим)\D{0,15}([+-]?\d+(?:\.\d+)?)\s*k", text_l)
+    if m:
+        return abs(_to_float(m.group(2)))
+
+    m = re.search(r"(net\s*worth|nw|advantage|преим)\D{0,15}([+-]?\d{3,5})\b", text_l)
+    if m:
+        return abs(_to_float(m.group(2)) / 1000)
+
+    # Иногда OCR оставляет просто '+3.5k' рядом с графиком.
+    m = re.search(r"([+-]\d+(?:\.\d+)?)\s*k\b", text_l)
+    if m:
+        return abs(_to_float(m.group(1)))
+
+    return 0.0
+
+
+def parse_market_lines(text: str) -> list[MarketLine]:
+    """
+    Парсит строки рынка Total Kills.
+
+    Поддерживаемые варианты:
+    - Under 1.94 — 54.5 — Over 1.77
+    - U 1.94 54.5 O 1.77
+    - ТМ 1.94 54.5 ТБ 1.77
+    - 54.5:U1.94/O1.77
+    - line=54.5 under=1.94 over=1.77
+    """
+    normalized = (
+        text.replace(",", ".")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("|", " ")
+    )
+
+    result: list[MarketLine] = []
+
+    # Формат из ручного ввода lines=54.5:U1.94/O1.77;55.5:U1.81/O1.89
+    for line, u, o in re.findall(
+        r"(\d{2,3}\.5)\s*:\s*(?:U|Under|ТМ|TM)\s*([12]\.\d{2})\s*/\s*(?:O|Over|ТБ|TB)\s*([12]\.\d{2})",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        result.append(MarketLine(line=_to_float(line), under_odds=_to_float(u), over_odds=_to_float(o)))
+
+    # Формат line=54.5 under=1.94 over=1.77
+    m = re.search(
+        r"line\s*=\s*(\d{2,3}\.5).*?under\s*=\s*([12]\.\d{2}).*?over\s*=\s*([12]\.\d{2})",
+        normalized,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        result.append(MarketLine(line=_to_float(m.group(1)), under_odds=_to_float(m.group(2)), over_odds=_to_float(m.group(3))))
+
+    # Формат Under 1.94 - 54.5 - Over 1.77.
+    pattern = (
+        r"(?:Under|U|ТМ|TM)\s*([12]\.\d{2})"
+        r"\D{0,12}"
+        r"(\d{2,3}\.5)"
+        r"\D{0,12}"
+        r"(?:Over|O|ТБ|TB)\s*([12]\.\d{2})"
+    )
+    for u, line, o in re.findall(pattern, normalized, flags=re.IGNORECASE):
+        result.append(MarketLine(line=_to_float(line), under_odds=_to_float(u), over_odds=_to_float(o)))
+
+    # Защита от дублей.
+    unique: dict[float, MarketLine] = {}
+    for item in result:
+        if item.line not in unique:
+            unique[item.line] = item
+
+    return sorted(unique.values(), key=lambda x: x.line)
+
+
+def parse_screens(map_image_path: str | Path, line_image_path: str | Path) -> MatchState:
+    map_text = ocr_image(map_image_path)
+    line_text = ocr_image(line_image_path)
+
+    time_str, time_minutes = extract_time(map_text)
+    score_a, score_b = extract_score(map_text)
+
+    state = MatchState(
+        match=extract_match_name(map_text),
+        time_str=time_str,
+        time_minutes=time_minutes,
+        score_a=score_a,
+        score_b=score_b,
+        networth_diff_k=extract_networth_diff_k(map_text),
+        lines=parse_market_lines(line_text),
+        raw_map_text=map_text,
+        raw_line_text=line_text,
+    )
+    return state
+
+
+def parse_manual_input(text: str) -> MatchState:
+    """
+    Ручной ввод от пользователя.
+
+    Минимальный формат:
+    match=Falcons-Spirit
+    time=5:33
+    score=1-1
+    nw=0.5
+    line=54.5
+    under=1.94
+    over=1.77
+
+    Или несколько линий:
+    lines=54.5:U1.94/O1.77;55.5:U1.81/O1.89
+    """
+    kv: dict[str, str] = {}
+
+    for raw_line in text.splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        kv[key.strip().lower()] = value.strip()
+
+    # Доп. поддержка ввода в одну строку: time=5:33 score=1-1 line=54.5 ...
+    for key in ["match", "map", "time", "score", "nw", "line", "under", "over", "lines"]:
+        if key not in kv:
+            m = re.search(rf"\b{key}\s*=\s*([^\n]+?)(?=\s+\w+\s*=|$)", text, flags=re.IGNORECASE)
+            if m:
+                kv[key] = m.group(1).strip()
+
+    time_str = kv.get("time", "")
+    time_minutes = parse_time_to_minutes(time_str)
+
+    score_a, score_b = 0, 0
+    score_raw = kv.get("score", "")
+    m = re.search(r"(\d{1,2})\s*[-:]\s*(\d{1,2})", score_raw)
+    if m:
+        score_a, score_b = int(m.group(1)), int(m.group(2))
+
+    lines: list[MarketLine] = []
+
+    if "lines" in kv:
+        lines = parse_market_lines(kv["lines"])
+
+    if not lines and "line" in kv:
+        lines = [
+            MarketLine(
+                line=_to_float(kv.get("line")),
+                under_odds=_to_float(kv.get("under")) if kv.get("under") else None,
+                over_odds=_to_float(kv.get("over")) if kv.get("over") else None,
+            )
+        ]
+
+    return MatchState(
+        match=kv.get("match", "Unknown"),
+        map_no=_to_int(kv.get("map")) if kv.get("map") else None,
+        time_str=time_str,
+        time_minutes=time_minutes,
+        score_a=score_a,
+        score_b=score_b,
+        networth_diff_k=abs(_to_float(kv.get("nw"))),
+        lines=lines,
+        raw_map_text=text,
+        raw_line_text=text,
+    )
+
+
+def state_to_dict(state: MatchState) -> dict:
+    return asdict(state)
+
+
+def state_from_dict(data: dict) -> MatchState:
+    lines = [MarketLine(**x) for x in data.get("lines", [])]
+    return MatchState(
+        match=data.get("match", "Unknown"),
+        map_no=data.get("map_no"),
+        time_str=data.get("time_str", ""),
+        time_minutes=float(data.get("time_minutes", 0.0)),
+        score_a=int(data.get("score_a", 0)),
+        score_b=int(data.get("score_b", 0)),
+        networth_diff_k=float(data.get("networth_diff_k", 0.0)),
+        lines=lines,
+        raw_map_text=data.get("raw_map_text", ""),
+        raw_line_text=data.get("raw_line_text", ""),
+    )
+
+
+def is_enough_for_analysis(state: MatchState) -> bool:
+    return bool(state.time_minutes > 0 and state.lines and (state.score_a + state.score_b) >= 0)

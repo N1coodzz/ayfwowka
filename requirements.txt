@@ -1,0 +1,45 @@
+from engine.decision_engine import analyze_state
+from ocr.parser import parse_manual_input
+
+
+def test_low_start_under():
+    state = parse_manual_input("""
+match=Falcons-Spirit
+time=5:33
+score=1-1
+nw=0.5
+line=54.5
+under=1.94
+over=1.77
+""")
+    decision = analyze_state(state)
+    assert decision.decision == "брать"
+    assert decision.best.side == "under"
+
+
+def test_stomp_high_over_pass():
+    state = parse_manual_input("""
+match=Liquid-Ex-Heroic
+time=16:27
+score=21-10
+nw=3.5
+line=67.5
+over=1.81
+""")
+    decision = analyze_state(state)
+    assert decision.decision == "пас"
+
+
+def test_vp_under():
+    state = parse_manual_input("""
+match=VP-GamerLegion
+time=7:04
+score=1-3
+nw=0.3
+line=53.5
+under=1.89
+over=1.87
+""")
+    decision = analyze_state(state)
+    assert decision.decision == "брать"
+    assert decision.best.side == "under"

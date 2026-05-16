@@ -1,0 +1,28 @@
+from dataclasses import dataclass
+from pathlib import Path
+import os
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    signals_csv: Path = Path(os.getenv("SIGNALS_CSV", "data/signals.csv"))
+    images_dir: Path = Path("data/images")
+
+
+def load_config() -> Config:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "BOT_TOKEN не найден. Создай .env на основе .env.example и вставь токен Telegram-бота."
+        )
+
+    cfg = Config(bot_token=token)
+    cfg.signals_csv.parent.mkdir(parents=True, exist_ok=True)
+    cfg.images_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
